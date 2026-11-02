@@ -13,6 +13,15 @@ const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY || '';
 const APP_BASE = (process.env.APP_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
 
+// Double-tap / expiry rules (see docs/PRD.md §4.3–§4.5):
+// - One active pending payment per sale: repeat initiate for the same link +
+//   customer email reuses the recent pending reference instead of inserting.
+// - Pending rows expire after PENDING_TTL_HOURS and stop showing as active.
+const PENDING_TTL_HOURS = Number(process.env.PENDING_TTL_HOURS || 24);
+const REUSE_WINDOW_MINUTES = Number(process.env.PENDING_REUSE_MINUTES || 30);
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = 10;
+
 const db = new Database(path.join(__dirname, 'data.db'));
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -47,9 +56,59 @@ db.exec(`
     status TEXT NOT NULL DEFAULT 'pending',
     paystack_id INTEGER,
     paid_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expired_at TEXT
   );
+  CREATE INDEX IF NOT EXISTS idx_payments_link_email_status ON payments(link_id, customer_email, status);
+  CREATE INDEX IF NOT EXISTS idx_payments_status_created ON payments(status, created_at);
 `);
+
+// Expired pending rows stop appearing as active: GET /api/payments and the
+// verify/webhook paths treat pending rows older than the TTL as expired.
+function pendingCutoffExpr() {
+  return `datetime('now', '-${PENDING_TTL_HOURS} hours')`;
+}
+function reuseCutoffExpr() {
+  return `datetime('now', '-${REUSE_WINDOW_MINUTES} minutes')`;
+}
+
+// Mark stale pending rows expired so they leave the active list without
+// manual work. Runs inline on reads/writes (single server, no cron).
+function expireStalePending() {
+  try {
+    db.prepare(
+      `UPDATE payments SET status = 'expired', expired_at = COALESCE(expired_at, datetime('now'))
+       WHERE status = 'pending' AND created_at < ${pendingCutoffExpr()}`
+    ).run();
+  } catch (e) { /* expiry is best-effort; reads still filter by cutoff */ }
+}
+
+// In-memory sliding-window rate limiter (single server): slows repeated
+// tries on sign-in and payment start so one script cannot block others.
+const rateBuckets = new Map();
+
+// created_at is stored as "YYYY-MM-DD HH:MM:SS" (UTC); compare in SQL where
+// possible, and here with a Date threshold for single-row checks.
+function isPendingExpired(payment) {
+  if (!payment || payment.status !== 'pending') return false;
+  const created = Date.parse(String(payment.created_at || '').replace(' ', 'T') + 'Z');
+  if (!Number.isFinite(created)) return false;
+  return Date.now() - created > PENDING_TTL_HOURS * 3600 * 1000;
+}
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const key = (req.ip || 'unknown') + ':' + req.path;
+  let hits = rateBuckets.get(key) || [];
+  hits = hits.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  if (hits.length >= RATE_LIMIT_MAX) {
+    res.set('Retry-After', String(Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)));
+    return res.status(429).json({ error: 'too_many_requests' });
+  }
+  hits.push(now);
+  rateBuckets.set(key, hits);
+  next();
+}
+function resetRateLimits() { rateBuckets.clear(); }
 
 // --- helpers ---
 const naira = (kobo) => (kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -110,7 +169,9 @@ app.post('/webhook/paystack', express.raw({ type: 'application/json' }), async (
     const event = JSON.parse(req.body.toString('utf8'));
     if (event.event === 'charge.success' && event.data && event.data.reference) {
       const payment = db.prepare('SELECT * FROM payments WHERE reference = ?').get(event.data.reference);
-      if (payment && payment.status !== 'paid' && payment.status !== 'refunded') {
+      if (payment && payment.status === 'pending' && isPendingExpired(payment)) {
+        db.prepare(`UPDATE payments SET status = 'expired', expired_at = COALESCE(expired_at, datetime('now')) WHERE id = ?`).run(payment.id);
+      } else if (payment && payment.status !== 'paid' && payment.status !== 'refunded') {
         try {
           const data = await paystackVerify(event.data.reference);
           if (data.status === 'success' && data.amount === payment.amount_kobo) markPaid(payment, data);
@@ -122,12 +183,11 @@ app.post('/webhook/paystack', express.raw({ type: 'application/json' }), async (
     res.status(400).json({ error: 'bad_webhook' });
   }
 });
-
 app.use(express.json());
 app.use(cookieParser());
 
 // --- auth ---
-app.post('/api/auth/signup', (req, res) => {
+app.post('/api/auth/signup', rateLimit, (req, res) => {
   const { businessName, email, password } = req.body || {};
   if (!businessName || !businessName.trim()) return res.status(400).json({ error: 'business_name_required' });
   if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'valid_email_required' });
@@ -144,7 +204,7 @@ app.post('/api/auth/signup', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', rateLimit, (req, res) => {
   const { email, password } = req.body || {};
   const m = db.prepare('SELECT * FROM merchants WHERE email = ?').get((email || '').toLowerCase());
   if (!m || !bcrypt.compareSync(password || '', m.password_hash)) {
@@ -193,9 +253,12 @@ app.get('/api/links', auth, (req, res) => {
 
 // --- merchant: payments + refund ---
 app.get('/api/payments', auth, (req, res) => {
+  expireStalePending();
   const rows = db.prepare(
     `SELECT p.*, l.title AS link_title FROM payments p JOIN links l ON l.id = p.link_id
-     WHERE p.merchant_id = ? ORDER BY p.id DESC LIMIT 200`
+     WHERE p.merchant_id = ?
+       AND NOT (p.status = 'pending' AND p.created_at < ${pendingCutoffExpr()})
+     ORDER BY p.id DESC LIMIT 200`
   ).all(req.merchant.id);
   res.json(rows.map((p) => ({ ...p, amountNaira: naira(p.amount_kobo) })));
 });
@@ -237,25 +300,70 @@ app.get('/api/pay/:code', (req, res) => {
   });
 });
 
-app.post('/api/pay/:code/initiate', (req, res) => {
+app.post('/api/pay/:code/initiate', rateLimit, (req, res) => {
+  expireStalePending();
   if (!PAYSTACK_PUBLIC || !PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured' });
   const link = db.prepare('SELECT * FROM links WHERE code = ?').get(req.params.code);
   if (!link) return res.status(404).json({ error: 'link_not_found' });
   const email = String((req.body || {}).email || '').trim();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'valid_email_required' });
+  const lowerEmail = email.toLowerCase();
+  // Double-tap rule: one active pending payment per sale. Repeat initiate
+  // for the same link + email within the reuse window returns the existing
+  // reference so the merchant sees one pending row and the customer sees
+  // one clear payment to finish.
+  const existing = db.prepare(
+    `SELECT * FROM payments WHERE link_id = ? AND customer_email = ? AND status = 'pending'
+     AND amount_kobo = ? AND created_at >= ${reuseCutoffExpr()}
+     ORDER BY id DESC LIMIT 1`
+  ).get(link.id, lowerEmail, link.amount_kobo);
+  if (existing) {
+    return res.json({
+      publicKey: PAYSTACK_PUBLIC,
+      reference: existing.reference,
+      amountKobo: link.amount_kobo,
+      email: lowerEmail,
+      reused: true,
+      message: 'A payment is already in progress for this sale — finish it instead of starting a new one.',
+    });
+  }
   const reference = newReference();
-  db.prepare(
-    'INSERT INTO payments (link_id, merchant_id, reference, amount_kobo, customer_email) VALUES (?, ?, ?, ?, ?)'
-  ).run(link.id, link.merchant_id, reference, link.amount_kobo, email.toLowerCase());
-  res.json({ publicKey: PAYSTACK_PUBLIC, reference, amountKobo: link.amount_kobo, email: email.toLowerCase() });
+  try {
+    db.prepare(
+      'INSERT INTO payments (link_id, merchant_id, reference, amount_kobo, customer_email) VALUES (?, ?, ?, ?, ?)'
+    ).run(link.id, link.merchant_id, reference, link.amount_kobo, lowerEmail);
+  } catch (e) {
+    // Concurrent double tap: re-read the row the other request just created.
+    const raced = db.prepare(
+      `SELECT * FROM payments WHERE link_id = ? AND customer_email = ? AND status = 'pending'
+       AND amount_kobo = ? ORDER BY id DESC LIMIT 1`
+    ).get(link.id, lowerEmail, link.amount_kobo);
+    if (raced) {
+      return res.json({
+        publicKey: PAYSTACK_PUBLIC,
+        reference: raced.reference,
+        amountKobo: link.amount_kobo,
+        email: lowerEmail,
+        reused: true,
+        message: 'A payment is already in progress for this sale — finish it instead of starting a new one.',
+      });
+    }
+    throw e;
+  }
+  res.json({ publicKey: PAYSTACK_PUBLIC, reference, amountKobo: link.amount_kobo, email: lowerEmail, reused: false });
 });
 
-app.post('/api/pay/:code/verify', async (req, res) => {
+app.post('/api/pay/:code/verify', rateLimit, async (req, res) => {
+  expireStalePending();
   if (!PAYSTACK_SECRET) return res.status(503).json({ error: 'paystack_not_configured' });
   const { reference } = req.body || {};
   if (!reference) return res.status(400).json({ error: 'reference_required' });
   const payment = db.prepare('SELECT * FROM payments WHERE reference = ?').get(reference);
   if (!payment) return res.status(404).json({ error: 'payment_not_found' });
+  // Expired pending rows are no longer active: tell the customer to restart.
+  if (payment.status === 'expired' || isPendingExpired(payment)) {
+    return res.status(410).json({ error: 'payment_expired', message: 'This payment expired — please start again from the payment link.' });
+  }
   const link = db.prepare('SELECT * FROM links WHERE id = ?').get(payment.link_id);
   if (!link || link.code !== req.params.code) return res.status(400).json({ error: 'reference_mismatch' });
   if (payment.status === 'paid') return res.json({ ok: true, status: 'paid' });
@@ -277,4 +385,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/pay/:code', (req, res) => res.sendFile(path.join(__dirname, 'public', 'pay.html')));
 app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'public', 'dashboard.html')));
 
-app.listen(PORT, () => console.log(`Merchant payments live on ${APP_BASE}`));
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Merchant payments live on ${APP_BASE}`));
+}
+
+module.exports = { app, db, resetRateLimits, expireStalePending, isPendingExpired, PENDING_TTL_HOURS, REUSE_WINDOW_MINUTES, RATE_LIMIT_MAX };
