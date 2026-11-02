@@ -30,6 +30,7 @@ th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
 .pending { background: #fef9c3; color: #854d0e; }
 .failed { background: #fee2e2; color: #991b1b; }
 .refunded, .refund_pending { background: #e0e7ff; color: #3730a3; }
+.expired { background: #f1f5f9; color: #64748b; }
 .msg { margin: 8px 0; font-size: 14px; }
 .msg.err { color: #b91c1c; }
 .msg.ok { color: var(--green-d); }

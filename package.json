@@ -4,7 +4,8 @@
   "description": "Payment links for small businesses in Lagos — Paystack checkout, merchant dashboard, refunds.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/pay-twice.test.js"
   },
   "license": "MIT",
   "dependencies": {

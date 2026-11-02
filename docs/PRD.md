@@ -53,6 +53,8 @@ Tech summary: Node.js + Express (`server.js`), SQLite via `better-sqlite3` (`dat
 1. Customer opens `GET /pay/:code` (static `public/pay.html`, data loaded from `GET /api/pay/:code`).
 2. Page shows business name, title, description, amount in ₦.
 3. Customer enters email → `POST /api/pay/:code/initiate` creates a `pending` payment row with a unique reference (`LGP_...`) and returns `{publicKey, reference, amountKobo, email}`.
+   **Repeat-tap rule:** tapping Pay twice for the same link + customer email (case-insensitive) within 30 minutes reuses the open `pending` reference and returns `{reused: true}` plus a customer message ("A payment is already in progress for this sale — finish it instead of starting a new one"). The merchant sees only one active `pending` row per sale; paid rows are never reused. Concurrent double taps are guarded by re-reading the just-created row instead of inserting a second.
+   **Request limits:** signup, login, initiate, and verify are rate-limited to 10 tries per minute per IP per route; excess calls return `429 { error: "too_many_requests" }` with a `Retry-After` header, and the pay page asks the customer to wait before retrying.
 4. Paystack Inline popup (`https://js.paystack.co/v1/inline.js`) collects payment in NGN.
 5. On popup callback, client calls `POST /api/pay/:code/verify` with `{reference}`. Server calls Paystack `GET /transaction/verify/:reference`, checks `status === 'success'` **and** amount matches, then marks payment `paid` (idempotent — re-verify of an already-paid payment returns success).
 6. Webhook `POST /webhook/paystack` runs in parallel: verifies `x-paystack-signature` (HMAC-SHA512 of raw body with secret key), handles `charge.success`, re-verifies with Paystack, and marks paid. Both paths are idempotent.
@@ -62,8 +64,8 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 
 ### 4.4 Dashboard payments and refunds
 
-- List: `GET /api/payments` — merchant's payments joined with link titles, newest first (limit 200), amounts formatted in ₦.
-- Statuses: `pending`, `paid`, `failed`, `refunded`, `refund_pending`.
+- List: `GET /api/payments` — merchant's payments joined with link titles, newest first (limit 200), amounts formatted in ₦. Stale `pending` rows past their lifetime are marked `expired` and excluded from the active list (see §4.5).
+- Statuses: `pending`, `paid`, `failed`, `refunded`, `refund_pending`, `expired`.
 - Refund: `POST /api/payments/:id/refund` — only `paid` payments with a stored `paystack_id`. Calls Paystack `POST /refund` with the transaction id. `refunded` on success, `refund_pending` if Paystack queues it. Full refunds only.
 - UI: payments table with status pills and a per-row Refund button (with confirm dialog).
 
@@ -72,15 +74,17 @@ Graceful degradation: without `PAYSTACK_SECRET_KEY` / `PAYSTACK_PUBLIC_KEY`, ini
 - `merchants(id, business_name, email UNIQUE, password_hash, created_at)`
 - `sessions(token PK, merchant_id, created_at)`
 - `links(id, merchant_id, code UNIQUE, title, description, amount_kobo, created_at)`
-- `payments(id, link_id, merchant_id, reference UNIQUE, amount_kobo, customer_email, status, paystack_id, paid_at, created_at)`
+- `payments(id, link_id, merchant_id, reference UNIQUE, amount_kobo, customer_email, status, paystack_id, paid_at, created_at, expired_at)`
+- **Pending lifetime:** `pending` rows expire 24 hours after `created_at` (`PENDING_TTL_HOURS`, overridable via env). Expiry is applied inline on reads/writes (`expireStalePending()`): expired rows get `status = 'expired'` + `expired_at`, stop appearing as active in `GET /api/payments`, and `verify`/webhook reject them (`410 { error: "payment_expired" }` → customer restarts from the link). The dashboard shows `expired` with its own pill so old rows leave the active list without manual work.
+- Lookup indexes: `(link_id, customer_email, status)` for the repeat-tap reuse query, `(status, created_at)` for expiry.
 
 ### 4.6 Configuration
 
-`.env` keys (see `.env.example`): `PORT`, `SESSION_SECRET`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY`, `APP_BASE_URL` (used to build shareable links).
+`.env` keys (see `.env.example`): `PORT`, `SESSION_SECRET`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY`, `APP_BASE_URL` (used to build shareable links), `PENDING_TTL_HOURS` (default 24), `PENDING_REUSE_MINUTES` (default 30).
 
 ## 5. Current limitations (known)
 
-- Single-server sessions; no password reset, email verification, or rate limiting.
+- Single-server sessions and in-memory rate limiting (resets on restart); no password reset or email verification.
 - One-time payments only — no recurring billing (see §6).
 - Full refunds only; no partial refunds, no dispute handling.
 - No search/filter/export on payments; list capped at 200.

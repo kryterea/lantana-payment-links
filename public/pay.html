@@ -51,7 +51,9 @@ document.getElementById('pay').onsubmit = async (e) => {
   e.preventDefault();
   const btn = document.getElementById('paybtn');
   const errBox = document.getElementById('p-err');
+  const okBox = document.getElementById('p-ok');
   errBox.textContent = '';
+  okBox.textContent = '';
   btn.disabled = true;
   try {
     const email = new FormData(e.target).get('email');
@@ -59,7 +61,9 @@ document.getElementById('pay').onsubmit = async (e) => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email })
     });
     const j = await r.json();
+    if (r.status === 429) throw new Error('Too many tries — please wait a minute and tap Pay once.');
     if (!r.ok) throw new Error(j.error === 'paystack_not_configured' ? 'Payments are not enabled yet — please contact the business.' : (j.error || 'Could not start payment.'));
+    if (j.reused || j.message) okBox.textContent = j.message || 'Resuming your pending payment — finish it below.';
     const handler = PaystackPop.setup({
       key: j.publicKey, email: j.email, amount: j.amountKobo, ref: j.reference, currency: 'NGN',
       callback: async function () {
@@ -70,6 +74,9 @@ document.getElementById('pay').onsubmit = async (e) => {
         if (v.ok && vj.status === 'paid') {
           document.getElementById('payform').style.display = 'none';
           document.getElementById('done').style.display = 'block';
+        } else if (v.status === 410 || vj.error === 'payment_expired') {
+          errBox.textContent = 'This payment expired — please tap Pay once to start a fresh one.';
+          btn.disabled = false;
         } else {
           errBox.textContent = 'We could not confirm your payment. If you were charged, the business will follow up.';
           btn.disabled = false;
